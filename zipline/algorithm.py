@@ -958,9 +958,11 @@ class TradingAlgorithm(object):
         self.blotter.cancel(order_id)
 
     @api_method
-    def add_history(self, bar_count, frequency, field, ffill=True):
+    def add_history(self, bar_count, frequency, field, dividend_adjusted=False,
+                    ffill=True):
         data_frequency = self.sim_params.data_frequency
-        history_spec = HistorySpec(bar_count, frequency, field, ffill,
+        history_spec = HistorySpec(bar_count, frequency, field,
+                                   dividend_adjusted, ffill,
                                    data_frequency=data_frequency)
         self.history_specs[history_spec.key_str] = history_spec
         if self.initialized:
@@ -976,14 +978,17 @@ class TradingAlgorithm(object):
                     self.sim_params.data_frequency,
                 )
 
-    def get_history_spec(self, bar_count, frequency, field, ffill):
-        spec_key = HistorySpec.spec_key(bar_count, frequency, field, ffill)
+    def get_history_spec(self, bar_count, frequency, field, dividend_adjusted,
+                         ffill):
+        spec_key = HistorySpec.spec_key(bar_count, frequency, field,
+                                        dividend_adjusted, ffill)
         if spec_key not in self.history_specs:
             data_freq = self.sim_params.data_frequency
             spec = HistorySpec(
                 bar_count,
                 frequency,
                 field,
+                dividend_adjusted,
                 ffill,
                 data_frequency=data_freq,
             )
@@ -1002,11 +1007,13 @@ class TradingAlgorithm(object):
         return self.history_specs[spec_key]
 
     @api_method
-    def history(self, bar_count, frequency, field, ffill=True):
+    def history(self, bar_count, frequency, field, dividend_adjusted=False,
+                ffill=True):
         history_spec = self.get_history_spec(
             bar_count,
             frequency,
             field,
+            dividend_adjusted,
             ffill,
         )
         return self.history_container.get_history(history_spec, self.datetime)

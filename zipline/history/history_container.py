@@ -467,6 +467,7 @@ class HistoryContainer(object):
         """
         Constructs a rolling panel with a properly aligned date_buf.
         """
+        do_dividend_adjust = spec.dividend_adjusted
         dt = normalize_to_data_freq(spec.frequency.data_frequency, dt)
 
         window = spec.bar_count - 1
@@ -483,6 +484,7 @@ class HistoryContainer(object):
             window=window,
             items=self.fields,
             sids=self.sids,
+            dividend_adjusted=spec.dividend_adjusted,
             initial_dates=date_buf,
         )
 
@@ -605,6 +607,7 @@ class HistoryContainer(object):
             )
 
             panels[freq] = rp
+            from nose.tools import set_trace; set_trace()
 
         return panels, first_window_starts, first_window_closes
 
@@ -639,7 +642,7 @@ class HistoryContainer(object):
         """
         return values
 
-    def digest_bars(self, history_spec, do_ffill):
+    def digest_bars(self, history_spec, do_dividend_adjust, do_ffill):
         """
         Get the last (history_spec.bar_count - 1) bars from self.digest_panel
         for the requested HistorySpec.
@@ -657,7 +660,7 @@ class HistoryContainer(object):
         # the requested field, the last (bar_count - 1) data points, and all
         # sids.
         digest_panel = self.digest_panels[history_spec.frequency]
-        frame = digest_panel.get_current(field, raw=True)
+        frame = digest_panel.get_current(field, do_dividend_adjust, raw=True)
         if do_ffill:
             # Do forward-filling *before* truncating down to the requested
             # number of bars.  This protects us from losing data if an illiquid
@@ -894,10 +897,12 @@ class HistoryContainer(object):
         @history_spec at the given @algo_dt.
         """
         field = history_spec.field
+        do_dividend_adjust = history_spec.dividend_adjusted
         do_ffill = history_spec.ffill
 
         # Get our stored values from periods prior to the current period.
-        digest_frame, index = self.digest_bars(history_spec, do_ffill)
+        digest_frame, index = self.digest_bars(history_spec,
+                                               do_dividend_adjust, do_ffill)
 
         # Get minutes from our buffer panel to build the last row of the
         # returned frame.

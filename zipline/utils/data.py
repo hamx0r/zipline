@@ -38,6 +38,7 @@ class RollingPanel(object):
                  window,
                  items,
                  sids,
+                 dividend_adjusted,
                  cap_multiple=2,
                  dtype=np.float64,
                  initial_dates=None):
@@ -49,6 +50,7 @@ class RollingPanel(object):
         self.minor_axis = _ensure_index(sids)
 
         self.cap_multiple = cap_multiple
+        self.dividend_adjusted = dividend_adjusted
 
         self.dtype = dtype
         if initial_dates is None:
@@ -163,7 +165,8 @@ class RollingPanel(object):
 
         self._pos += 1
 
-    def get_current(self, item=None, raw=False, start=None, end=None):
+    def get_current(self, item=None, dividend_adjusted=False, raw=False,
+                    start=None, end=None):
         """
         Get a Panel that is the current data in view. It is not safe to persist
         these objects because internal data might change
