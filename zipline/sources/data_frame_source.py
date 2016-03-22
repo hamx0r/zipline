@@ -38,12 +38,15 @@ class DataFrameSource(DataSource):
 
     def __init__(self, data, **kwargs):
         assert isinstance(data.index, pd.tseries.index.DatetimeIndex)
-
-        self.data = data
+        # Only accept integer SIDs as the items of the DataFrame
+        assert isinstance(data.columns, pd.Int64Index)
+        # TODO is ffilling correct/necessary?
+        # Forward fill prices
+        self.data = data.fillna(method='ffill')
         # Unpack config dictionary with default values.
-        self.sids = kwargs.get('sids', data.columns)
-        self.start = kwargs.get('start', data.index[0])
-        self.end = kwargs.get('end', data.index[-1])
+        self.start = kwargs.get('start', self.data.index[0])
+        self.end = kwargs.get('end', self.data.index[-1])
+        self.sids = self.data.columns
 
         # Hash_value for downstream sorting.
         self.arg_string = hash_args(data, **kwargs)
@@ -68,22 +71,21 @@ class DataFrameSource(DataSource):
     def raw_data_gen(self):
         for dt, series in self.data.iterrows():
             for sid, price in series.iteritems():
-                if sid in self.sids:
-                    # Skip SIDs that can not be forward filled
-                    if np.isnan(price) and \
-                       sid not in self.started_sids:
-                        continue
-                    self.started_sids.add(sid)
+                # Skip SIDs that can not be forward filled
+                if np.isnan(price) and \
+                   sid not in self.started_sids:
+                    continue
+                self.started_sids.add(sid)
 
-                    event = {
-                        'dt': dt,
-                        'sid': sid,
-                        'price': price,
-                        # Just chose something large
-                        # if no volume available.
-                        'volume': 1e9,
-                    }
-                    yield event
+                event = {
+                    'dt': dt,
+                    'sid': sid,
+                    'price': price,
+                    # Just chose something large
+                    # if no volume available.
+                    'volume': 1e9,
+                }
+                yield event
 
     @property
     def raw_data(self):
@@ -107,12 +109,15 @@ class DataPanelSource(DataSource):
 
     def __init__(self, data, **kwargs):
         assert isinstance(data.major_axis, pd.tseries.index.DatetimeIndex)
-
-        self.data = data
+        # Only accept integer SIDs as the items of the Panel
+        assert isinstance(data.items, pd.Int64Index)
+        # TODO is ffilling correct/necessary?
+        # forward fill with volumes of 0
+        self.data = data.fillna(value={'volume': 0})
         # Unpack config dictionary with default values.
-        self.sids = kwargs.get('sids', data.items)
-        self.start = kwargs.get('start', data.major_axis[0])
-        self.end = kwargs.get('end', data.major_axis[-1])
+        self.start = kwargs.get('start', self.data.major_axis[0])
+        self.end = kwargs.get('end', self.data.major_axis[-1])
+        self.sids = self.data.items
 
         # Hash_value for downstream sorting.
         self.arg_string = hash_args(data, **kwargs)
@@ -146,21 +151,19 @@ class DataPanelSource(DataSource):
         for dt in self.data.major_axis:
             df = self.data.major_xs(dt)
             for sid, series in df.iteritems():
-                if sid in self.sids:
-                    # Skip SIDs that can not be forward filled
-                    if np.isnan(series['price']) and \
-                       sid not in self.started_sids:
-                        continue
-                    self.started_sids.add(sid)
+                # Skip SIDs that can not be forward filled
+                if np.isnan(series['price']):
+                    continue
+                self.started_sids.add(sid)
 
-                    event = {
-                        'dt': dt,
-                        'sid': sid,
-                    }
-                    for field_name, value in series.iteritems():
-                        event[field_name] = value
+                event = {
+                    'dt': dt,
+                    'sid': sid,
+                }
+                for field_name, value in series.iteritems():
+                    event[field_name] = value
 
-                    yield event
+                yield event
 
     @property
     def raw_data(self):

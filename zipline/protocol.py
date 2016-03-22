@@ -12,17 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from copy import copy
 
 from six import iteritems, iterkeys
 import pandas as pd
 import numpy as np
 
-from . utils.protocol_utils import Enum
-from . utils.math_utils import nanstd, nanmean, nansum
+from .utils.enum import enum
+from .utils.math_utils import nanstd, nanmean, nansum
 
-from zipline.finance.trading import with_environment
 from zipline.utils.algo_instance import get_algo_instance
 from zipline.utils.serialization_utils import (
     VERSION_LABEL
@@ -30,7 +28,7 @@ from zipline.utils.serialization_utils import (
 
 # Datasource type should completely determine the other fields of a
 # message with its type.
-DATASOURCE_TYPE = Enum(
+DATASOURCE_TYPE = enum(
     'AS_TRADED_EQUITY',
     'MERGER',
     'SPLIT',
@@ -42,7 +40,8 @@ DATASOURCE_TYPE = Enum(
     'DONE',
     'CUSTOM',
     'BENCHMARK',
-    'COMMISSION'
+    'COMMISSION',
+    'CLOSE_POSITION'
 )
 
 # Expected fields/index values for a dividend Series.
@@ -57,7 +56,12 @@ DIVIDEND_FIELDS = [
     'sid',
 ]
 # Expected fields/index values for a dividend payment Series.
-DIVIDEND_PAYMENT_FIELDS = ['id', 'payment_sid', 'cash_amount', 'share_count']
+DIVIDEND_PAYMENT_FIELDS = [
+    'id',
+    'payment_sid',
+    'cash_amount',
+    'share_count',
+]
 
 
 def dividend_payment(data=None):
@@ -72,7 +76,7 @@ def dividend_payment(data=None):
     payment.
 
     Additionally, if @data is non-empty, either data['cash_amount'] should be
-    nonzero or data['payment_sid'] should be a security identifier and
+    nonzero or data['payment_sid'] should be an asset identifier and
     data['share_count'] should be nonzero.
 
     The returned Series is given its id value as a name so that concatenating
@@ -288,7 +292,6 @@ class SIDData(object):
 
     def __init__(self, sid, initial_values=None):
         self._sid = sid
-
         self._freqstr = None
 
         # To check if we have data, we use the __len__ which depends on the
@@ -373,7 +376,7 @@ class SIDData(object):
         else:
             return buffer_[self._sid][-bars:]
 
-    def _get_bars(self, days):
+    def _cache_daily_minutely(self, days, fn):
         """
         Gets the number of bars needed for the current number of days.
 
@@ -394,8 +397,7 @@ class SIDData(object):
         def daily_get_bars(days):
             return days
 
-        @with_environment()
-        def minute_get_bars(days, env=None):
+        def minute_get_bars(days):
             cls = self.__class__
 
             now = get_algo_instance().datetime
@@ -406,6 +408,7 @@ class SIDData(object):
             if days not in cls._minute_bar_cache:
                 # Cache this calculation to happen once per bar, even if we
                 # use another transform with the same number of days.
+                env = get_algo_instance().trading_environment
                 prev = env.previous_trading_day(now)
                 ds = env.days_in_range(
                     env.add_trading_days(-days + 2, prev),
@@ -435,8 +438,20 @@ class SIDData(object):
             self._get_bars = minute_get_bars
             self._get_max_bars = minute_get_max_bars
 
+        # NOTE: This silently adds these two entries to the `__dict__`
+        # without affecting the `__len__` of the object. This is important
+        # because we use the `len` of the `SIDData` object to see if we have
+        # data for this asset.
+        self._initial_len += 2
+
         # Not actually recursive because we have already cached the new method.
-        return self._get_bars(days)
+        return getattr(self, fn)(days)
+
+    def _get_bars(self, bars):
+        return self._cache_daily_minutely(bars, fn='_get_bars')
+
+    def _get_max_bars(self, bars):
+        return self._cache_daily_minutely(bars, fn='_get_max_bars')
 
     def mavg(self, days):
         bars = self._get_bars(days)
@@ -487,7 +502,7 @@ class BarData(object):
     """
 
     def __init__(self, data=None):
-        self._data = data or {}
+        self._data = data if data is not None else {}
         self._contains_override = None
 
     def __contains__(self, name):

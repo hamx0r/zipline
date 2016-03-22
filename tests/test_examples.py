@@ -16,48 +16,37 @@
 # This code is based on a unittest written by John Salvatier:
 # https://github.com/pymc-devs/pymc/blob/pymc3/tests/test_examples.py
 
-# Disable plotting
-#
+import glob
 import matplotlib
-
+from nose_parameterized import parameterized
 import os
-from os import path
+import runpy
+from unittest import TestCase
 
-try:
-    from path import walk
-except ImportError:
-    # Assume Python 3
-    from os import walk
+from zipline.utils import parse_args, run_pipeline
 
-import fnmatch
-import imp
+# Otherwise the next line sometimes complains about being run too late.
+_multiprocess_can_split_ = False
 
 matplotlib.use('Agg')
 
 
-def test_examples():
-    os.chdir(example_dir())
-    for fname in all_matching_files(example_dir(), '*.py'):
-        yield check_example, fname
-
-
-def all_matching_files(d, pattern):
-    def addfiles(fls, dir, nfiles):
-        nfiles = fnmatch.filter(nfiles, pattern)
-        nfiles = [path.join(dir, f) for f in nfiles]
-        fls.extend(nfiles)
-
-    files = []
-    for dirpath, dirnames, filenames in walk(d):
-        addfiles(files, dirpath, filenames)
-    return files
-
-
 def example_dir():
     import zipline
-    d = path.dirname(zipline.__file__)
-    return path.join(path.abspath(d), 'examples/')
+    d = os.path.dirname(zipline.__file__)
+    return os.path.join(os.path.abspath(d), 'examples')
 
 
-def check_example(p):
-    imp.load_source('__main__', path.basename(p))
+class ExamplesTests(TestCase):
+    # Test algorithms as if they are executed directly from the command line.
+    @parameterized.expand(((os.path.basename(f).replace('.', '_'), f) for f in
+                           glob.glob(os.path.join(example_dir(), '*.py'))))
+    def test_example(self, name, example):
+        runpy.run_path(example, run_name='__main__')
+
+    # Test algorithm as if scripts/run_algo.py is being used.
+    def test_example_run_pipline(self):
+        example = os.path.join(example_dir(), 'buyapple.py')
+        confs = ['-f', example, '--start', '2011-1-1', '--end', '2012-1-1']
+        parsed_args = parse_args(confs)
+        run_pipeline(**parsed_args)

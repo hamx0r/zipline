@@ -16,13 +16,22 @@
 import bisect
 import logbook
 import datetime
-from functools import wraps
 
 import pandas as pd
 import numpy as np
+from six import string_types
+from sqlalchemy import create_engine
 
 from zipline.data.loader import load_market_data
 from zipline.utils import tradingcalendar
+from zipline.assets import AssetFinder
+from zipline.assets.asset_writer import (
+    AssetDBWriterFromList,
+    AssetDBWriterFromDictionary,
+    AssetDBWriterFromDataFrame)
+from zipline.errors import (
+    NoFurtherDataError
+)
 
 
 log = logbook.Logger('Trading')
@@ -42,65 +51,39 @@ log = logbook.Logger('Trading')
 #   for serialization and storage, and the timezone is used to
 #   ensure proper rollover through daylight savings and so on.
 #
-# This module maintains a global variable, environment, which is
-# subsequently referenced directly by zipline financial
-# components. To set the environment, you can set the property on
-# the module directly:
-#       from zipline.finance import trading
-#       trading.environment = TradingEnvironment()
-#
-# or if you want to switch the environment for a limited context
-# you can use a TradingEnvironment in a with clause:
-#       lse = TradingEnvironment(bm_index="^FTSE", exchange_tz="Europe/London")
-#       with lse:
-# the code here will have lse as the global trading.environment
-#           algo.run(start, end)
-#
 # User code will not normally need to use TradingEnvironment
 # directly. If you are extending zipline's core financial
-# compponents and need to use the environment, you must import the module
-# NOT the variable. If you import the module, you will get a
-# reference to the environment at import time, which will prevent
-# your code from responding to user code that changes the global
-# state.
-
-environment = None
-
-
-class NoFurtherDataError(Exception):
-    """
-    Thrown when next trading is attempted at the end of available data.
-    """
-    pass
-
+# components and need to use the environment, you must import the module and
+# build a new TradingEnvironment object, then pass that TradingEnvironment as
+# the 'env' arg to your TradingAlgorithm.
 
 class TradingEnvironment(object):
 
-    @classmethod
-    def instance(cls):
-        global environment
-        if not environment:
-            environment = TradingEnvironment()
-
-        return environment
+    # Token used as a substitute for pickling objects that contain a
+    # reference to a TradingEnvironment
+    PERSISTENT_TOKEN = "<TradingEnvironment>"
 
     def __init__(
         self,
         load=None,
         bm_symbol='^GSPC',
         exchange_tz="US/Eastern",
+        min_date=None,
         max_date=None,
-        env_trading_calendar=tradingcalendar
+        env_trading_calendar=tradingcalendar,
+        asset_db_path=':memory:'
     ):
+        """
+        @load is function that returns benchmark_returns and treasury_curves
+        The treasury_curves are expected to be a DataFrame with an index of
+        dates and columns of the curve names, e.g. '10year', '1month', etc.
+        """
         self.trading_day = env_trading_calendar.trading_day.copy()
 
         # `tc_td` is short for "trading calendar trading days"
         tc_td = env_trading_calendar.trading_days
 
-        if max_date:
-            self.trading_days = tc_td[tc_td <= max_date].copy()
-        else:
-            self.trading_days = tc_td.copy()
+        self.trading_days = tc_td[tc_td.slice_indexer(min_date, max_date)]
 
         self.first_trading_day = self.trading_days[0]
         self.last_trading_day = self.trading_days[-1]
@@ -111,15 +94,13 @@ class TradingEnvironment(object):
         self.open_and_closes = env_trading_calendar.open_and_closes.loc[
             self.trading_days]
 
-        self.prev_environment = self
         self.bm_symbol = bm_symbol
         if not load:
             load = load_market_data
 
-        self.benchmark_returns, treasury_curves_map = \
+        self.benchmark_returns, self.treasury_curves = \
             load(self.trading_day, self.trading_days, self.bm_symbol)
 
-        self.treasury_curves = pd.DataFrame(treasury_curves_map).T
         if max_date:
             tr_c = self.treasury_curves
             # Mask the treasury curves down to the current date.
@@ -130,20 +111,119 @@ class TradingEnvironment(object):
 
         self.exchange_tz = exchange_tz
 
-    def __enter__(self, *args, **kwargs):
-        global environment
-        self.prev_environment = environment
-        environment = self
-        # return value here is associated with "as such_and_such" on the
-        # with clause.
-        return self
+        if isinstance(asset_db_path, string_types):
+            asset_db_path = 'sqlite:///%s' % asset_db_path
+            self.engine = engine = create_engine(asset_db_path)
+            AssetDBWriterFromDictionary().init_db(engine)
+        else:
+            self.engine = engine = asset_db_path
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        global environment
-        environment = self.prev_environment
-        # signal that any exceptions need to be propagated up the
-        # stack.
-        return False
+        if engine is not None:
+            self.asset_finder = AssetFinder(engine)
+        else:
+            self.asset_finder = None
+
+    def write_data(self,
+                   engine=None,
+                   equities_data=None,
+                   futures_data=None,
+                   exchanges_data=None,
+                   root_symbols_data=None,
+                   equities_df=None,
+                   futures_df=None,
+                   exchanges_df=None,
+                   root_symbols_df=None,
+                   equities_identifiers=None,
+                   futures_identifiers=None,
+                   exchanges_identifiers=None,
+                   root_symbols_identifiers=None,
+                   allow_sid_assignment=True):
+        """ Write the supplied data to the database.
+
+        Parameters
+        ----------
+        equities_data: dict, optional
+            A dictionary of equity metadata
+        futures_data: dict, optional
+            A dictionary of futures metadata
+        exchanges_data: dict, optional
+            A dictionary of exchanges metadata
+        root_symbols_data: dict, optional
+            A dictionary of root symbols metadata
+        equities_df: pandas.DataFrame, optional
+            A pandas.DataFrame of equity metadata
+        futures_df: pandas.DataFrame, optional
+            A pandas.DataFrame of futures metadata
+        exchanges_df: pandas.DataFrame, optional
+            A pandas.DataFrame of exchanges metadata
+        root_symbols_df: pandas.DataFrame, optional
+            A pandas.DataFrame of root symbols metadata
+        equities_identifiers: list, optional
+            A list of equities identifiers (sids, symbols, Assets)
+        futures_identifiers: list, optional
+            A list of futures identifiers (sids, symbols, Assets)
+        exchanges_identifiers: list, optional
+            A list of exchanges identifiers (ids or names)
+        root_symbols_identifiers: list, optional
+            A list of root symbols identifiers (ids or symbols)
+        """
+        if engine:
+            self.engine = engine
+
+        # If any pandas.DataFrame data has been provided,
+        # write it to the database.
+        has_rows = lambda df: df is not None and len(df) > 0
+        if any(map(has_rows, [equities_df,
+                              futures_df,
+                              exchanges_df,
+                              root_symbols_df])):
+            self._write_data_dataframes(
+                equities=equities_df,
+                futures=futures_df,
+                exchanges=exchanges_df,
+                root_symbols=root_symbols_df,
+            )
+
+        # Same for dicts.
+        has_data = lambda d: d is not None and len(d) > 0
+        if any(map(has_data, [equities_data,
+                              futures_data,
+                              exchanges_data,
+                              futures_data])):
+            self._write_data_dicts(
+                equities=equities_data,
+                futures=futures_data,
+                exchanges=exchanges_data,
+                root_symbols=root_symbols_data
+            )
+
+        # Same for iterables.
+        if any(map(has_data, [equities_identifiers,
+                              futures_identifiers,
+                              exchanges_identifiers,
+                              root_symbols_identifiers])):
+            self._write_data_lists(
+                equities=equities_identifiers,
+                futures=futures_identifiers,
+                exchanges=exchanges_identifiers,
+                root_symbols=root_symbols_identifiers,
+                allow_sid_assignment=allow_sid_assignment
+            )
+
+    def _write_data_lists(self, equities=None, futures=None, exchanges=None,
+                          root_symbols=None, allow_sid_assignment=True):
+        AssetDBWriterFromList(equities, futures, exchanges, root_symbols)\
+            .write_all(self.engine, allow_sid_assignment=allow_sid_assignment)
+
+    def _write_data_dicts(self, equities=None, futures=None, exchanges=None,
+                          root_symbols=None):
+        AssetDBWriterFromDictionary(equities, futures, exchanges, root_symbols)\
+            .write_all(self.engine)
+
+    def _write_data_dataframes(self, equities=None, futures=None,
+                               exchanges=None, root_symbols=None):
+        AssetDBWriterFromDataFrame(equities, futures, exchanges, root_symbols)\
+            .write_all(self.engine)
 
     def normalize_date(self, test_date):
         test_date = pd.Timestamp(test_date, tz='UTC')
@@ -211,7 +291,9 @@ class TradingEnvironment(object):
 
         idx = self.get_index(date) + n
         if idx < 0 or idx >= len(self.trading_days):
-            raise NoFurtherDataError('Cannot add %d days to %s' % (n, date))
+            raise NoFurtherDataError(
+                msg='Cannot add %d days to %s' % (n, date)
+            )
 
         return self.trading_days[idx]
 
@@ -252,8 +334,9 @@ class TradingEnvironment(object):
 
         if next_open is None:
             raise NoFurtherDataError(
-                "Attempt to backtest beyond available history. \
-Last successful date: %s" % self.last_trading_day)
+                msg=("Attempt to backtest beyond available history. "
+                     "Last known date: %s" % self.last_trading_day)
+            )
 
         return self.get_open_and_close(next_open)
 
@@ -266,33 +349,50 @@ Last successful date: %s" % self.last_trading_day)
 
         if previous is None:
             raise NoFurtherDataError(
-                "Attempt to backtest beyond available history. "
-                "First successful date: %s" % self.first_trading_day)
+                msg=("Attempt to backtest beyond available history. "
+                     "First known date: %s" % self.first_trading_day)
+            )
         return self.get_open_and_close(previous)
 
     def next_market_minute(self, start):
         """
         Get the next market minute after @start. This is either the immediate
-        next minute, or the open of the next market day after start.
+        next minute, the open of the same day if @start is before the market
+        open on a trading day, or the open of the next market day after @start.
         """
-        next_minute = start + datetime.timedelta(minutes=1)
-        if self.is_market_hours(next_minute):
-            return next_minute
+        if self.is_trading_day(start):
+            market_open, market_close = self.get_open_and_close(start)
+            # If start before market open on a trading day, return market open.
+            if start < market_open:
+                return market_open
+            # If start is during trading hours, then get the next minute.
+            elif start < market_close:
+                return start + datetime.timedelta(minutes=1)
+        # If start is not in a trading day, or is after the market close
+        # then return the open of the *next* trading day.
         return self.next_open_and_close(start)[0]
 
     def previous_market_minute(self, start):
         """
         Get the next market minute before @start. This is either the immediate
-        previous minute, or the close of the market day before start.
+        previous minute, the close of the same day if @start is after the close
+        on a trading day, or the close of the market day before @start.
         """
-        prev_minute = start - datetime.timedelta(minutes=1)
-        if self.is_market_hours(prev_minute):
-            return prev_minute
+        if self.is_trading_day(start):
+            market_open, market_close = self.get_open_and_close(start)
+            # If start after the market close, return market close.
+            if start > market_close:
+                return market_close
+            # If start is during trading hours, then get previous minute.
+            if start > market_open:
+                return start - datetime.timedelta(minutes=1)
+        # If start is not a trading day, or is before the market open
+        # then return the close of the *previous* trading day.
         return self.previous_open_and_close(start)[1]
 
     def get_open_and_close(self, day):
         index = self.open_and_closes.index.get_loc(day.date())
-        todays_minutes = self.open_and_closes.values[index]
+        todays_minutes = self.open_and_closes.iloc[index]
         return todays_minutes[0], todays_minutes[1]
 
     def market_minutes_for_day(self, stamp):
@@ -387,7 +487,7 @@ class SimulationParameters(object):
                  capital_base=10e3,
                  emission_rate='daily',
                  data_frequency='daily',
-                 sids=None):
+                 env=None):
 
         self.period_start = period_start
         self.period_end = period_end
@@ -395,60 +495,57 @@ class SimulationParameters(object):
 
         self.emission_rate = emission_rate
         self.data_frequency = data_frequency
-        self.sids = sids
 
         # copied to algorithm's environment for runtime access
         self.arena = 'backtest'
 
-        self._update_internal()
+        if env is not None:
+            self.update_internal_from_env(env=env)
 
-    def _update_internal(self):
-        # This is the global environment for trading simulation.
-        environment = TradingEnvironment.instance()
+    def update_internal_from_env(self, env):
 
         assert self.period_start <= self.period_end, \
             "Period start falls after period end."
 
-        assert self.period_start <= environment.last_trading_day, \
+        assert self.period_start <= env.last_trading_day, \
             "Period start falls after the last known trading day."
-        assert self.period_end >= environment.first_trading_day, \
+        assert self.period_end >= env.first_trading_day, \
             "Period end falls before the first known trading day."
 
-        self.first_open = self.calculate_first_open()
-        self.last_close = self.calculate_last_close()
-        start_index = \
-            environment.get_index(self.first_open)
-        end_index = environment.get_index(self.last_close)
+        self.first_open = self._calculate_first_open(env)
+        self.last_close = self._calculate_last_close(env)
+
+        start_index = env.get_index(self.first_open)
+        end_index = env.get_index(self.last_close)
 
         # take an inclusive slice of the environment's
         # trading_days.
-        self.trading_days = \
-            environment.trading_days[start_index:end_index + 1]
+        self.trading_days = env.trading_days[start_index:end_index + 1]
 
-    def calculate_first_open(self):
+    def _calculate_first_open(self, env):
         """
         Finds the first trading day on or after self.period_start.
         """
         first_open = self.period_start
         one_day = datetime.timedelta(days=1)
 
-        while not environment.is_trading_day(first_open):
+        while not env.is_trading_day(first_open):
             first_open = first_open + one_day
 
-        mkt_open, _ = environment.get_open_and_close(first_open)
+        mkt_open, _ = env.get_open_and_close(first_open)
         return mkt_open
 
-    def calculate_last_close(self):
+    def _calculate_last_close(self, env):
         """
         Finds the last trading day on or before self.period_end
         """
         last_close = self.period_end
         one_day = datetime.timedelta(days=1)
 
-        while not environment.is_trading_day(last_close):
+        while not env.is_trading_day(last_close):
             last_close = last_close - one_day
 
-        _, mkt_close = environment.get_open_and_close(last_close)
+        _, mkt_close = env.get_open_and_close(last_close)
         return mkt_close
 
     @property
@@ -476,31 +573,12 @@ class SimulationParameters(object):
            last_close=self.last_close)
 
 
-def with_environment(asname='env'):
+def noop_load(*args, **kwargs):
     """
-    Decorator to automagically pass TradingEnvironment to the function
-    under the name asname. If the environment is passed explicitly as a keyword
-    then the explicitly passed value will be used instead.
+    A method that can be substituted in as the load method in a
+    TradingEnvironment to prevent it from loading benchmarks.
 
-    usage:
-       with_environment()
-       def f(env=None):
-           pass
-
-       with_environment(asname='my_env')
-       def g(my_env=None):
-           pass
+    Accepts any arguments, but returns only a tuple of Nones regardless
+    of input.
     """
-    def with_environment_decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            # inject env into the namespace for the function.
-            # This doesn't use setdefault so that grabbing the trading env
-            # is lazy.
-            if asname not in kwargs:
-                kwargs[asname] = TradingEnvironment.instance()
-            return f(*args, **kwargs)
-
-        return wrapper
-
-    return with_environment_decorator
+    return None, None

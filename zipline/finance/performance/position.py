@@ -20,12 +20,11 @@ Position Tracking
     +-----------------+----------------------------------------------------+
     | key             | value                                              |
     +=================+====================================================+
-    | sid             | the identifier for the security held in this       |
-    |                 | position.                                          |
+    | sid             | the sid for the asset held in this position        |
     +-----------------+----------------------------------------------------+
     | amount          | whole number of shares in the position             |
     +-----------------+----------------------------------------------------+
-    | last_sale_price | price at last sale of the security on the exchange |
+    | last_sale_price | price at last sale of the asset on the exchange    |
     +-----------------+----------------------------------------------------+
     | cost_basis      | the volume weighted average price paid per share   |
     +-----------------+----------------------------------------------------+
@@ -33,14 +32,13 @@ Position Tracking
 """
 
 from __future__ import division
-from math import (
-    copysign,
-    floor,
-)
+from math import copysign
+from collections import OrderedDict
 
 from copy import copy
 
 import logbook
+import numpy as np
 import zipline.protocol as zp
 
 from zipline.utils.serialization_utils import (
@@ -72,7 +70,8 @@ class Position(object):
         # stock dividend
         if dividend['payment_sid']:
             out['payment_sid'] = dividend['payment_sid']
-            out['share_count'] = floor(self.amount * float(dividend['ratio']))
+            out['share_count'] = np.floor(self.amount
+                                          * float(dividend['ratio']))
 
         # cash dividend
         if dividend['net_amount']:
@@ -83,20 +82,18 @@ class Position(object):
         payment_owed = zp.dividend_payment(out)
         return payment_owed
 
-    def handle_split(self, split):
+    def handle_split(self, sid, ratio):
         """
         Update the position by the split ratio, and return the resulting
         fractional share that will be converted into cash.
 
         Returns the unused cash.
         """
-        if self.sid != split.sid:
+        if self.sid != sid:
             raise Exception("updating split with the wrong sid!")
 
-        ratio = split.ratio
-
-        log.info("handling split for sid = " + str(split.sid) +
-                 ", ratio = " + str(split.ratio))
+        log.info("handling split for sid = " + str(sid) +
+                 ", ratio = " + str(ratio))
         log.info("before split: " + str(self))
 
         # adjust the # of shares by the ratio
@@ -109,7 +106,7 @@ class Position(object):
         raw_share_count = self.amount / float(ratio)
 
         # e.g., 33
-        full_share_count = floor(raw_share_count)
+        full_share_count = np.floor(raw_share_count)
 
         # e.g., 0.333
         fractional_share_count = raw_share_count - full_share_count
@@ -166,7 +163,7 @@ class Position(object):
 
         self.amount = total_shares
 
-    def adjust_commission_cost_basis(self, commission):
+    def adjust_commission_cost_basis(self, sid, cost):
         """
         A note about cost-basis in zipline: all positions are considered
         to share a cost basis, even if they were executed in different
@@ -177,9 +174,9 @@ class Position(object):
         all shares in a position.
         """
 
-        if commission.sid != self.sid:
+        if sid != self.sid:
             raise Exception('Updating a commission for a different sid?')
-        if commission.cost == 0.0:
+        if cost == 0.0:
             return
 
         # If we no longer hold this position, there is no cost basis to
@@ -188,7 +185,7 @@ class Position(object):
             return
 
         prev_cost = self.cost_basis * self.amount
-        new_cost = prev_cost + commission.cost
+        new_cost = prev_cost + cost
         self.cost_basis = new_cost / self.amount
 
     def __repr__(self):
@@ -232,7 +229,7 @@ last_sale_price: {last_sale_price}"
         self.__dict__.update(state)
 
 
-class positiondict(dict):
+class positiondict(OrderedDict):
 
     def __missing__(self, key):
         pos = Position(key)

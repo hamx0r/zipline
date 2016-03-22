@@ -12,16 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from datetime import timedelta
+from itertools import takewhile
+
+from contextlib2 import ExitStack
 from logbook import Logger, Processor
 from pandas.tslib import normalize_date
 
-from zipline.finance import trading
+from zipline.errors import SidsNotFound
+from zipline.finance.trading import NoFurtherDataError
 from zipline.protocol import (
     BarData,
+    DATASOURCE_TYPE,
+    Event,
     SIDData,
-    DATASOURCE_TYPE
 )
-from zipline.gens.utils import hash_args
+from zipline.utils.api_support import ZiplineAPI
+from zipline.utils.data import SortedDict
 
 log = Logger('Trade Simulation')
 
@@ -32,13 +39,6 @@ class AlgorithmSimulator(object):
         'minute': 'minute_perf',
         'daily': 'daily_perf'
     }
-
-    def get_hash(self):
-        """
-        There should only ever be one TSC in the system, so
-        we don't bother passing args into the hash.
-        """
-        return self.__class__.__name__ + hash_args()
 
     def __init__(self, algo, sim_params):
 
@@ -53,15 +53,75 @@ class AlgorithmSimulator(object):
         # ==============
         self.algo = algo
         self.algo_start = normalize_date(self.sim_params.first_open)
+        self.env = algo.trading_environment
 
         # ==============
         # Snapshot Setup
         # ==============
 
+        _day = timedelta(days=1)
+
+        def _get_removal_date(sid,
+                              finder=self.env.asset_finder,
+                              default=self.sim_params.last_close + _day):
+            """
+            Get the date of the morning on which we should remove an asset from
+            data.
+
+            If we don't have an auto_close_date, this is just the end of the
+            simulation.
+
+            If we have an auto_close_date, then we remove assets from data on
+            max(asset.auto_close_date, asset.end_date + timedelta(days=1))
+
+            We hold assets at least until auto_close_date because up until that
+            date the user might still hold positions or have open orders in an
+            expired asset.
+
+            We hold assets at least until end_date + 1, because an asset
+            continues trading until the **end** of its end_date.  Even if an
+            asset auto-closed before the end_date (say, because Interactive
+            Brokers clears futures positions prior the actual notice or
+            expiration), there may still be trades arriving that represent
+            signals for other assets that are still tradeable. (Particularly in
+            the futures case, trading in the final days of a contract are
+            likely relevant for trading the next contract on the same future
+            chain.)
+            """
+            try:
+                asset = finder.retrieve_asset(sid)
+            except ValueError:
+                # Handle sid not an int, such as from a custom source.
+                # So that they don't compare equal to other sids, and we'd
+                # blow up comparing strings to ints, let's give them unique
+                # close dates.
+                return default + timedelta(microseconds=id(sid))
+            except SidsNotFound:
+                return default
+
+            auto_close_date = asset.auto_close_date
+            if auto_close_date is None:
+                # If we don't have an auto_close_date, we never remove an asset
+                # from the user's portfolio.
+                return default
+
+            end_date = asset.end_date
+            if end_date is None:
+                # If we have an auto_close_date but not an end_date, clear the
+                # asset from data when we clear positions/orders.
+                return auto_close_date
+
+            # If we have both, make close once we're on or after the
+            # auto_close_date, and strictly after the end_date.
+            # See docstring above for an explanation of this logic.
+            return max(auto_close_date, end_date + _day)
+
+        self._get_removal_date = _get_removal_date
+
         # The algorithm's data as of our most recent event.
-        # We want an object that will have empty objects as default
-        # values on missing keys.
-        self.current_data = BarData()
+        # Maintain sids in order by asset close date, so that we can more
+        # efficiently remove them when their times come...
+        self.current_data = BarData(SortedDict(self._get_removal_date))
 
         # We don't have a datetime for the current snapshot until we
         # receive a message.
@@ -78,17 +138,6 @@ class AlgorithmSimulator(object):
                 record.extra['algo_dt'] = self.simulation_dt
         self.processor = Processor(inject_algo_dt)
 
-    @property
-    def perf_key(self):
-        return self.EMISSION_TO_PERF_KEY_MAP[
-            self.algo.perf_tracker.emission_rate]
-
-    def _process_event(self, blotter_process_trade, perf_process_event, event):
-        for txn, order in blotter_process_trade(event):
-            perf_process_event(txn)
-            perf_process_event(order)
-        perf_process_event(event)
-
     def transform(self, stream_in):
         """
         Main generator work loop.
@@ -99,7 +148,11 @@ class AlgorithmSimulator(object):
 
         # inject the current algo
         # snapshot time to any log record generated.
-        with self.processor.threadbound():
+
+        with ExitStack() as stack:
+            stack.enter_context(self.processor)
+            stack.enter_context(ZiplineAPI(self.algo))
+
             data_frequency = self.sim_params.data_frequency
 
             self._call_before_trading_start(mkt_open)
@@ -117,58 +170,43 @@ class AlgorithmSimulator(object):
                         if event.type == DATASOURCE_TYPE.SPLIT:
                             self.algo.blotter.process_split(event)
 
-                        elif event.type in (DATASOURCE_TYPE.TRADE,
-                                            DATASOURCE_TYPE.CUSTOM):
+                        elif event.type == DATASOURCE_TYPE.TRADE:
                             self.update_universe(event)
-                        self.algo.perf_tracker.process_event(event)
+                            self.algo.perf_tracker.process_trade(event)
+                        elif event.type == DATASOURCE_TYPE.CUSTOM:
+                            self.update_universe(event)
+
                 else:
-                    message = self._process_snapshot(
+                    messages = self._process_snapshot(
                         date,
                         snapshot,
                         self.algo.instant_fill,
                     )
                     # Perf messages are only emitted if the snapshot contained
                     # a benchmark event.
-                    if message is not None:
+                    for message in messages:
                         yield message
 
-                    # When emitting minutely, we re-iterate the day as a
-                    # packet with the entire days performance rolled up.
+                    # When emitting minutely, we need to call
+                    # before_trading_start before the next trading day begins
                     if date == mkt_close:
-                        if self.algo.perf_tracker.emission_rate == 'minute':
-                            daily_rollup = self.algo.perf_tracker.to_dict(
-                                emission_type='daily'
-                            )
-                            daily_rollup['daily_perf']['recorded_vars'] = \
-                                self.algo.recorded_vars
-                            yield daily_rollup
-                            tp = self.algo.perf_tracker.todays_performance
-                            tp.rollover()
-
                         if mkt_close <= self.algo.perf_tracker.last_close:
                             before_last_close = \
                                 mkt_close < self.algo.perf_tracker.last_close
                             try:
                                 mkt_open, mkt_close = \
-                                    trading.environment \
-                                           .next_open_and_close(mkt_close)
+                                    self.env.next_open_and_close(mkt_close)
 
-                            except trading.NoFurtherDataError:
+                            except NoFurtherDataError:
                                 # If at the end of backtest history,
                                 # skip advancing market close.
                                 pass
-                            if self.algo.perf_tracker.emission_rate == \
-                               'minute':
-                                self.algo.perf_tracker\
-                                         .handle_intraday_market_close(
-                                             mkt_open,
-                                             mkt_close)
 
                             if before_last_close:
                                 self._call_before_trading_start(mkt_open)
 
                     elif data_frequency == 'daily':
-                        next_day = trading.environment.next_trading_day(date)
+                        next_day = self.env.next_trading_day(date)
 
                         if next_day is not None and \
                            next_day < self.algo.perf_tracker.last_close:
@@ -213,52 +251,132 @@ class AlgorithmSimulator(object):
         #
         # Done here, to allow for perf_tracker or blotter to be swapped out
         # or changed in between snapshots.
-        perf_process_event = self.algo.perf_tracker.process_event
+        perf_process_trade = self.algo.perf_tracker.process_trade
+        perf_process_transaction = self.algo.perf_tracker.process_transaction
+        perf_process_order = self.algo.perf_tracker.process_order
+        perf_process_benchmark = self.algo.perf_tracker.process_benchmark
+        perf_process_split = self.algo.perf_tracker.process_split
+        perf_process_dividend = self.algo.perf_tracker.process_dividend
+        perf_process_commission = self.algo.perf_tracker.process_commission
+        perf_process_close_position = \
+            self.algo.perf_tracker.process_close_position
         blotter_process_trade = self.algo.blotter.process_trade
-        process_event = self._process_event
+        blotter_process_benchmark = self.algo.blotter.process_benchmark
+
+        # Containers for the snapshotted events, so that the events are
+        # processed in a predictable order, without relying on the sorted order
+        # of the individual sources.
+
+        # There is only one benchmark per snapshot, will be set to the current
+        # benchmark iff it occurs.
+        benchmark = None
+        # trades and customs are initialized as a list since process_snapshot
+        # is most often called on market bars, which could contain trades or
+        # custom events.
+        trades = []
+        customs = []
+        closes = []
+
+        # splits and dividends are processed once a day.
+        #
+        # The avoidance of creating the list every time this is called is more
+        # to attempt to show that this is the infrequent case of the method,
+        # since the performance benefit from deferring the list allocation is
+        # marginal.  splits list will be allocated when a split occurs in the
+        # snapshot.
+        splits = None
+        # dividends list will be allocated when a dividend occurs in the
+        # snapshot.
+        dividends = None
 
         for event in snapshot:
-
             if event.type == DATASOURCE_TYPE.TRADE:
-                self.update_universe(event)
-                any_trade_occurred = True
-
+                trades.append(event)
             elif event.type == DATASOURCE_TYPE.BENCHMARK:
-                benchmark_event_occurred = True
-
-            elif event.type == DATASOURCE_TYPE.CUSTOM:
-                self.update_universe(event)
-
+                benchmark = event
             elif event.type == DATASOURCE_TYPE.SPLIT:
+                if splits is None:
+                    splits = []
+                splits.append(event)
+            elif event.type == DATASOURCE_TYPE.CUSTOM:
+                customs.append(event)
+            elif event.type == DATASOURCE_TYPE.DIVIDEND:
+                if dividends is None:
+                    dividends = []
+                dividends.append(event)
+            elif event.type == DATASOURCE_TYPE.CLOSE_POSITION:
+                closes.append(event)
+            else:
+                raise log.warn("Unrecognized event=%s".format(event))
+
+        # Handle benchmark first.
+        #
+        # Internal broker implementation depends on the benchmark being
+        # processed first so that transactions and commissions reported from
+        # the broker can be injected.
+        if benchmark is not None:
+            benchmark_event_occurred = True
+            perf_process_benchmark(benchmark)
+            for txn, order in blotter_process_benchmark(benchmark):
+                if txn.type == DATASOURCE_TYPE.TRANSACTION:
+                    perf_process_transaction(txn)
+                elif txn.type == DATASOURCE_TYPE.COMMISSION:
+                    perf_process_commission(txn)
+                perf_process_order(order)
+
+        for trade in trades:
+            self.update_universe(trade)
+            any_trade_occurred = True
+            if instant_fill:
+                events_to_be_processed.append(trade)
+            else:
+                for txn, order in blotter_process_trade(trade):
+                    if txn.type == DATASOURCE_TYPE.TRANSACTION:
+                        perf_process_transaction(txn)
+                    elif txn.type == DATASOURCE_TYPE.COMMISSION:
+                        perf_process_commission(txn)
+                    perf_process_order(order)
+                perf_process_trade(trade)
+
+        for custom in customs:
+            self.update_universe(custom)
+
+        for close in closes:
+            self.update_universe(close)
+            perf_process_close_position(close)
+
+        if splits is not None:
+            for split in splits:
                 # process_split is not assigned to a variable since it is
                 # called rarely compared to the other event processors.
-                self.algo.blotter.process_split(event)
+                self.algo.blotter.process_split(split)
+                perf_process_split(split)
 
-            if not instant_fill:
-                process_event(blotter_process_trade,
-                              perf_process_event,
-                              event)
-            else:
-                events_to_be_processed.append(event)
+        if dividends is not None:
+            for dividend in dividends:
+                perf_process_dividend(dividend)
 
         if any_trade_occurred:
             new_orders = self._call_handle_data()
             for order in new_orders:
-                perf_process_event(order)
+                perf_process_order(order)
 
         if instant_fill:
             # Now that handle_data has been called and orders have been placed,
             # process the event stream to fill user orders based on the events
             # from this snapshot.
-            for event in events_to_be_processed:
-                process_event(blotter_process_trade,
-                              perf_process_event,
-                              event)
+            for trade in events_to_be_processed:
+                for txn, order in blotter_process_trade(trade):
+                    if txn is not None:
+                        perf_process_transaction(txn)
+                    if order is not None:
+                        perf_process_order(order)
+                perf_process_trade(trade)
 
         if benchmark_event_occurred:
-            return self.get_message(dt)
+            return self.generate_messages(dt)
         else:
-            return None
+            return ()
 
     def _call_handle_data(self):
         """
@@ -278,15 +396,82 @@ class AlgorithmSimulator(object):
         dt = normalize_date(dt)
         self.simulation_dt = dt
         self.on_dt_changed(dt)
-        self.algo.before_trading_start()
+
+        self._cleanup_expired_assets(dt, self.current_data, self.algo.blotter)
+
+        self.algo.before_trading_start(self.current_data)
+
+    def _cleanup_expired_assets(self, dt, current_data, algo_blotter):
+        """
+        Clear out any assets that have expired before starting a new sim day.
+
+        Performs three functions:
+
+        1. Finds all assets for which we have open orders and clears any
+           orders whose assets are on or after their auto_close_date.
+
+        2. Finds all assets for which we have positions and generates
+           close_position events for any assets that have reached their
+           auto_close_date.
+
+        3. Finds and removes from data all sids for which
+           _get_removal_date(sid) <= dt.
+        """
+        algo = self.algo
+        expired = list(takewhile(
+            lambda asset_id: self._get_removal_date(asset_id) <= dt,
+            self.current_data
+        ))
+        for sid in expired:
+            try:
+                del self.current_data[sid]
+            except KeyError:
+                continue
+
+        def create_close_position_event(asset):
+            event = Event({
+                'dt': dt,
+                'type': DATASOURCE_TYPE.CLOSE_POSITION,
+                'sid': asset.sid,
+            })
+            return event
+
+        def past_auto_close_date(asset):
+            acd = asset.auto_close_date
+            return acd is not None and acd <= dt
+
+        # Remove positions in any sids that have reached their auto_close date.
+        to_clear = []
+        finder = algo.asset_finder
+        perf_tracker = algo.perf_tracker
+        nonempty_position_assets = finder.retrieve_all(
+            # get_nonempty_position_sids us just the non-empty positions, and
+            # also avoids an unnecessary re-compuation of the portfolio.
+            perf_tracker.position_tracker.get_nonempty_position_sids()
+        )
+        for asset in nonempty_position_assets:
+            if past_auto_close_date(asset):
+                to_clear.append(asset)
+        for close_event in map(create_close_position_event, to_clear):
+            perf_tracker.process_close_position(close_event)
+
+        # Remove open orders for any sids that have reached their
+        # auto_close_date.
+        blotter = algo.blotter
+        to_cancel = []
+        for asset in blotter.open_orders:
+            if past_auto_close_date(asset):
+                to_cancel.append(asset)
+        for asset in to_cancel:
+            blotter.cancel_all(asset)
 
     def on_dt_changed(self, dt):
         if self.algo.datetime != dt:
             self.algo.on_dt_changed(dt)
 
-    def get_message(self, dt):
+    def generate_messages(self, dt):
         """
-        Get a perf message for the given datetime.
+        Generator that yields perf messages for the given datetime.
         """
         # Ensure that updated_portfolio has been called at least once for this
         # dt before we emit a perf message.  This is a no-op if
@@ -299,13 +484,22 @@ class AlgorithmSimulator(object):
             perf_message = \
                 self.algo.perf_tracker.handle_market_close_daily()
             perf_message['daily_perf']['recorded_vars'] = rvars
-            return perf_message
+            yield perf_message
 
         elif self.algo.perf_tracker.emission_rate == 'minute':
-            self.algo.perf_tracker.handle_minute_close(dt)
-            perf_message = self.algo.perf_tracker.to_dict()
-            perf_message['minute_perf']['recorded_vars'] = rvars
-            return perf_message
+            # close the minute in the tracker, and collect the daily message if
+            # the minute is the close of the trading day
+            minute_message, daily_message = \
+                self.algo.perf_tracker.handle_minute_close(dt)
+
+            # collect and yield the minute's perf message
+            minute_message['minute_perf']['recorded_vars'] = rvars
+            yield minute_message
+
+            # if there was a daily perf message, collect and yield it
+            if daily_message:
+                daily_message['daily_perf']['recorded_vars'] = rvars
+                yield daily_message
 
     def update_universe(self, event):
         """

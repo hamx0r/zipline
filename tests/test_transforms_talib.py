@@ -12,32 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import pytz
-import numpy as np
-import pandas as pd
-
 from datetime import timedelta, datetime
 from unittest import TestCase, skip
 
-from zipline.utils.test_utils import setup_logger
-
-import zipline.utils.factory as factory
-
-from zipline.test_algorithms import TALIBAlgorithm
-
+import numpy as np
+import pandas as pd
+import pytz
 import talib
+
+from zipline.finance.trading import TradingEnvironment
+from zipline.test_algorithms import TALIBAlgorithm
+from zipline.testing import setup_logger, teardown_logger
 import zipline.transforms.ta as ta
+import zipline.utils.factory as factory
 
 
 class TestTALIB(TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = TradingEnvironment()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
+
     def setUp(self):
         setup_logger(self)
         sim_params = factory.create_simulation_parameters(
             start=datetime(1990, 1, 1, tzinfo=pytz.utc),
             end=datetime(1990, 3, 30, tzinfo=pytz.utc))
         self.source, self.panel = \
-            factory.create_test_panel_ohlc_source(sim_params)
+            factory.create_test_panel_ohlc_source(sim_params, self.env)
+
+    def tearDown(self):
+        teardown_logger(self)
 
     @skip
     def test_talib_with_default_params(self):
@@ -57,7 +66,7 @@ class TestTALIB(TestCase):
             sim_params = factory.create_simulation_parameters(
                 start=start, end=end)
             source, panel = \
-                factory.create_test_panel_ohlc_source(sim_params)
+                factory.create_test_panel_ohlc_source(sim_params, self.env)
 
             algo = TALIBAlgorithm(talib=zipline_transform)
             algo.run(source)
@@ -95,7 +104,7 @@ class TestTALIB(TestCase):
         zipline_transforms = [ta.MA(timeperiod=10),
                               ta.MA(timeperiod=25)]
         talib_fn = talib.abstract.MA
-        algo = TALIBAlgorithm(talib=zipline_transforms)
+        algo = TALIBAlgorithm(talib=zipline_transforms, identifiers=[0])
         algo.run(self.source)
         # Test if computed values match those computed by pandas rolling mean.
         sid = 0

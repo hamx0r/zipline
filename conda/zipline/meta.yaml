@@ -1,34 +1,40 @@
+{% set data = load_setuptools() %}
+
 package:
   name: zipline
-  version: 0.8.0rc1
+  version: {{ environ.get('GIT_DESCRIBE_TAG', '')}}
+
+build:
+  number: {{ environ.get('GIT_DESCRIBE_NUMBER', 0) }}
 
 source:
-  fn: zipline-0.8.0rc1.tar.gz
-  url: https://pypi.python.org/packages/source/z/zipline/zipline-0.8.0rc1.tar.gz
-  md5: f23bdd0a8671b3b297072391fc817097
+  git_url: ../../
 
 requirements:
   build:
     - python
-    - setuptools
-    - cython
+    {% for req in data.get('build_requires', []) -%}
+    - {{req}}
+    {% endfor %}
   run:
     - python
-    - pytz
-    - requests
-    - numpy
-    - pandas
-    - scipy
-    - matplotlib
-    - logbook
+    {% for req in data.get('install_requires', []) -%}
+    - {{req}}
+    {% endfor %}
 
 test:
+  {#  When we include the tests module in the zipline package, we can use this:
+  requires:
+    {% for req in data.get('extras_require', {}).get('dev', []) -%}
+    - {{req}}
+    {% endfor %}
+  #}
   # Python imports
   imports:
     - zipline
 
 about:
-  home: https://github.com/quantopian/zipline
+  home: https://zipline.io
   license: Apache Software License
 
 # See

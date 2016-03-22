@@ -26,16 +26,17 @@ import pytz
 from zipline.finance import trading
 from zipline.algorithm import TradingAlgorithm
 from zipline.finance import slippage
-from zipline.utils import factory
-from zipline.utils.factory import create_simulation_parameters
-from zipline.utils.test_utils import (
+from zipline.protocol import (
+    Event,
+    DATASOURCE_TYPE,
+)
+from zipline.testing import (
     setup_logger,
     teardown_logger
 )
-from zipline.protocol import (
-    Event,
-    DATASOURCE_TYPE
-)
+from zipline.utils import factory
+from zipline.utils.factory import create_simulation_parameters
+
 
 DEFAULT_TIMEOUT = 15  # seconds
 EXTENDED_TIMEOUT = 90
@@ -62,7 +63,7 @@ class TestAlgo(TradingAlgorithm):
         self.latest_date = None
 
         self.set_slippage(RecordDateSlippage(spread=0.05))
-        self.stocks = [8229]
+        self.stocks = [self.sid(8229)]
         self.ordered = False
         self.num_bars = 0
 
@@ -85,6 +86,16 @@ class TestAlgo(TradingAlgorithm):
 
 
 class AlgorithmGeneratorTestCase(TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = trading.TradingEnvironment()
+        cls.env.write_data(equities_identifiers=[8229])
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
+
     def setUp(self):
         setup_logger(self)
 
@@ -105,7 +116,9 @@ class AlgorithmGeneratorTestCase(TestCase):
                 start=datetime(2012, 5, 1, tzinfo=pytz.utc),
                 end=datetime(2012, 6, 30, tzinfo=pytz.utc)
             )
-            algo = TestAlgo(self, sim_params=sim_params)
+            algo = TestAlgo(self, identifiers=[8229], sim_params=sim_params)
+            # This call appears inconsistent with
+            # the signature of create_daily_trade_source
             trade_source = factory.create_daily_trade_source(
                 [8229],
                 200,
@@ -127,15 +140,17 @@ class AlgorithmGeneratorTestCase(TestCase):
         Ensure the pipeline of generators are in sync, at least as far as
         their current dates.
         """
+
         sim_params = factory.create_simulation_parameters(
             start=datetime(2011, 7, 30, tzinfo=pytz.utc),
-            end=datetime(2012, 7, 30, tzinfo=pytz.utc)
+            end=datetime(2012, 7, 30, tzinfo=pytz.utc),
+            env=self.env,
         )
-        algo = TestAlgo(self, sim_params=sim_params)
+        algo = TestAlgo(self, sim_params=sim_params, env=self.env)
         trade_source = factory.create_daily_trade_source(
             [8229],
-            200,
-            sim_params
+            sim_params,
+            env=self.env,
         )
         algo.set_sources([trade_source])
 
@@ -157,10 +172,10 @@ class AlgorithmGeneratorTestCase(TestCase):
         sim_params = SimulationParameters(
             period_start=datetime(2012, 7, 30, tzinfo=pytz.utc),
             period_end=datetime(2012, 7, 30, tzinfo=pytz.utc),
-            data_frequency='minute'
+            data_frequency='minute',
+            env=self.env,
         )
-        algo = TestAlgo(self,
-                        sim_params=sim_params)
+        algo = TestAlgo(self, sim_params=sim_params, env=self.env)
 
         midnight_custom_source = [Event({
             'custom_field': 42.0,
@@ -200,13 +215,14 @@ class AlgorithmGeneratorTestCase(TestCase):
         """
         sim_params = factory.create_simulation_parameters(
             start=datetime(2008, 1, 1, tzinfo=pytz.utc),
-            end=datetime(2008, 1, 5, tzinfo=pytz.utc)
+            end=datetime(2008, 1, 5, tzinfo=pytz.utc),
+            env=self.env,
         )
-        algo = TestAlgo(self, sim_params=sim_params)
+        algo = TestAlgo(self, sim_params=sim_params, env=self.env)
         trade_source = factory.create_daily_trade_source(
             [8229],
-            3,
-            sim_params
+            sim_params,
+            env=self.env,
         )
         algo.set_sources([trade_source])
 
@@ -224,7 +240,8 @@ class AlgorithmGeneratorTestCase(TestCase):
         See https://github.com/quantopian/zipline/issues/241
         """
         sim_params = create_simulation_parameters(num_days=1,
-                                                  data_frequency='minute')
-        algo = TestAlgo(self, sim_params=sim_params)
-        algo.run(source=[])
+                                                  data_frequency='minute',
+                                                  env=self.env)
+        algo = TestAlgo(self, sim_params=sim_params, env=self.env)
+        algo.run(source=[], overwrite_sim_params=False)
         self.assertEqual(algo.datetime, sim_params.last_close)

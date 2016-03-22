@@ -6,35 +6,31 @@ import pandas as pd
 import pytz
 import zipline
 
+from zipline.errors import SymbolNotFound
+
 
 DATE_FORMAT = "%Y%m%d"
-zipline_dir = os.path.join(*zipline.__path__)
+zipline_dir = os.path.dirname(zipline.__file__)
 SECURITY_LISTS_DIR = os.path.join(zipline_dir, 'resources', 'security_lists')
-
-
-def loopback(symbol, *args, **kwargs):
-    return symbol
 
 
 class SecurityList(object):
 
-    def __init__(self, lookup_func, data, current_date_func):
+    def __init__(self, data, current_date_func, asset_finder):
         """
-        lookup_func: function that takes a string symbol and a date and
-        returns a Security object.
         data: a nested dictionary:
             knowledge_date -> lookup_date ->
               {add: [symbol list], 'delete': []}, delete: [symbol list]}
         current_date_func: function taking no parameters, returning
             current datetime
         """
-        self.lookup_func = lookup_func
         self.data = data
         self._cache = {}
         self._knowledge_dates = self.make_knowledge_dates(self.data)
         self.current_date = current_date_func
         self.count = 0
         self._current_set = set()
+        self.asset_finder = asset_finder
 
     def make_knowledge_dates(self, data):
         knowledge_dates = sorted(
@@ -76,11 +72,15 @@ class SecurityList(object):
 
     def update_current(self, effective_date, symbols, change_func):
         for symbol in symbols:
-            sid = self.lookup_func(
-                symbol,
-                as_of_date=effective_date
-            )
-            change_func(sid)
+            try:
+                asset = self.asset_finder.lookup_symbol(
+                    symbol,
+                    as_of_date=effective_date
+                )
+            # Pass if no Asset exists for the symbol
+            except SymbolNotFound:
+                continue
+            change_func(asset.sid)
 
 
 class SecurityListSet(object):
@@ -88,21 +88,18 @@ class SecurityListSet(object):
     # list implementations.
     security_list_type = SecurityList
 
-    def __init__(self, current_date_func, lookup_func=None):
-        if lookup_func is None:
-            self.lookup_func = loopback
-        else:
-            self.lookup_func = lookup_func
+    def __init__(self, current_date_func, asset_finder):
         self.current_date_func = current_date_func
+        self.asset_finder = asset_finder
         self._leveraged_etf = None
 
     @property
     def leveraged_etf_list(self):
         if self._leveraged_etf is None:
             self._leveraged_etf = self.security_list_type(
-                self.lookup_func,
                 load_from_directory('leveraged_etf_list'),
-                self.current_date_func
+                self.current_date_func,
+                asset_finder=self.asset_finder
             )
         return self._leveraged_etf
 

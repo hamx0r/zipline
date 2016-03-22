@@ -1,3 +1,4 @@
+# cython: embedsignature=True
 #
 # Copyright 2015 Quantopian, Inc.
 #
@@ -17,13 +18,26 @@
 Cythonized Asset object.
 """
 cimport cython
+from cpython.number cimport PyNumber_Index
+from cpython.object cimport (
+    Py_EQ,
+    Py_NE,
+    Py_GE,
+    Py_LE,
+    Py_GT,
+    Py_LT,
+)
+
+from numbers import Integral
 
 import numpy as np
+import warnings
 cimport numpy as np
 
-cdef enum AssetType:
-    EQUITY = 1
-    FUTURE = 2
+# IMPORTANT NOTE: You must change this template if you change
+# Asset.__reduce__, or else we'll attempt to unpickle an old version of this
+# class
+CACHE_FILE_TEMPLATE = '/tmp/.%s-%s.v6.cache'
 
 cdef class Asset:
 
@@ -33,12 +47,11 @@ cdef class Asset:
 
     cdef readonly object symbol
     cdef readonly object asset_name
-    cdef readonly AssetType asset_type
 
-    # TODO: Maybe declare as pandas Timestamp?
     cdef readonly object start_date
     cdef readonly object end_date
     cdef public object first_traded
+    cdef readonly object auto_close_date
 
     cdef readonly object exchange
 
@@ -49,6 +62,7 @@ cdef class Asset:
                   object start_date=None,
                   object end_date=None,
                   object first_traded=None,
+                  object auto_close_date=None,
                   object exchange="",
                   *args,
                   **kwargs):
@@ -61,79 +75,52 @@ cdef class Asset:
         self.start_date    = start_date
         self.end_date      = end_date
         self.first_traded  = first_traded
+        self.auto_close_date = auto_close_date
 
     def __int__(self):
+        return self.sid
+
+    def __index__(self):
         return self.sid
 
     def __hash__(self):
         return self.sid_hash
 
-    property asset_start_date:
-        """
-        Alias for start_date to disambiguate from other `start_date`s in the
-        system.
-        """
-        def __get__(self):
-            return self.start_date
-
-    property asset_end_date:
-        """
-        Alias for end_date to disambiguate from other `end_date`s in the
-        system.
-        """
-        def __get__(self):
-            return self.end_date
-
     def __richcmp__(x, y, int op):
         """
         Cython rich comparison method.  This is used in place of various
         equality checkers in pure python.
-
-        <	0
-        <=	1
-        ==	2
-        !=	3
-        >	4
-        >=	5
         """
         cdef int x_as_int, y_as_int
 
-        if isinstance(x, Asset):
-            x_as_int = x.sid
-        elif isinstance(x, int):
-            x_as_int = x
-        else:
+        try:
+            x_as_int = PyNumber_Index(x)
+        except (TypeError, OverflowError):
             return NotImplemented
 
-        if isinstance(y, Asset):
-            y_as_int = y.sid
-        elif isinstance(y, int):
-            y_as_int = y
-        else:
+        try:
+            y_as_int = PyNumber_Index(y)
+        except (TypeError, OverflowError):
             return NotImplemented
 
         compared = x_as_int - y_as_int
 
         # Handle == and != first because they're significantly more common
         # operations.
-        if op == 2:
-            # Equality
+        if op == Py_EQ:
             return compared == 0
-        elif op == 3:
-            # Non-equality
+        elif op == Py_NE:
             return compared != 0
-        elif op == 0:
-            # <
+        elif op == Py_LT:
             return compared < 0
-        elif op == 1:
-            # <=
+        elif op == Py_LE:
             return compared <= 0
-        elif op == 4:
-            # >
+        elif op == Py_GT:
             return compared > 0
-        elif op == 5:
-            # >=
+        elif op == Py_GE:
             return compared >= 0
+        else:
+            raise AssertionError('%d is not an operator' % op)
 
     def __str__(self):
         if self.symbol:
@@ -143,7 +130,7 @@ cdef class Asset:
 
     def __repr__(self):
         attrs = ('symbol', 'asset_name', 'exchange',
-                 'start_date', 'end_date', 'first_traded')
+                 'start_date', 'end_date', 'first_traded', 'auto_close_date')
         tuples = ((attr, repr(getattr(self, attr, None)))
                   for attr in attrs)
         strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
@@ -163,6 +150,7 @@ cdef class Asset:
                                  self.start_date,
                                  self.end_date,
                                  self.first_traded,
+                                 self.auto_close_date,
                                  self.exchange,))
 
     cpdef to_dict(self):
@@ -176,66 +164,158 @@ cdef class Asset:
             'start_date': self.start_date,
             'end_date': self.end_date,
             'first_traded': self.first_traded,
+            'auto_close_date': self.auto_close_date,
             'exchange': self.exchange,
         }
 
-    @staticmethod
-    def from_dict(dict_):
+    @classmethod
+    def from_dict(cls, dict_):
         """
         Build an Asset instance from a dict.
         """
-        return Asset(**dict_)
+        return cls(**dict_)
 
 
 cdef class Equity(Asset):
 
-    def __cinit__(self,
-                  int sid, # sid is required
-                  object symbol="",
-                  object asset_name="",
-                  object start_date=None,
-                  object end_date=None,
-                  object first_traded=None,
-                  object exchange=""):
-
-        self.asset_type = EQUITY
+    def __str__(self):
+        if self.symbol:
+            return 'Equity(%d [%s])' % (self.sid, self.symbol)
+        else:
+            return 'Equity(%d)' % self.sid
 
     def __repr__(self):
         attrs = ('symbol', 'asset_name', 'exchange',
-                 'start_date', 'end_date', 'first_traded')
+                 'start_date', 'end_date', 'first_traded', 'auto_close_date')
         tuples = ((attr, repr(getattr(self, attr, None)))
                   for attr in attrs)
         strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
         params = ', '.join(strings)
         return 'Equity(%d, %s)' % (self.sid, params)
 
+    property security_start_date:
+        """
+        DEPRECATION: This property should be deprecated and is only present for
+        backwards compatibility
+        """
+        def __get__(self):
+            warnings.warn("The security_start_date property will soon be "
+            "retired. Please use the start_date property instead.",
+            DeprecationWarning)
+            return self.start_date
+
+    property security_end_date:
+        """
+        DEPRECATION: This property should be deprecated and is only present for
+        backwards compatibility
+        """
+        def __get__(self):
+            warnings.warn("The security_end_date property will soon be "
+            "retired. Please use the end_date property instead.",
+            DeprecationWarning)
+            return self.end_date
+
+    property security_name:
+        """
+        DEPRECATION: This property should be deprecated and is only present for
+        backwards compatibility
+        """
+        def __get__(self):
+            warnings.warn("The security_name property will soon be "
+            "retired. Please use the asset_name property instead.",
+            DeprecationWarning)
+            return self.asset_name
+
 
 cdef class Future(Asset):
 
+    cdef readonly object root_symbol
     cdef readonly object notice_date
     cdef readonly object expiration_date
+    cdef readonly object tick_size
+    cdef readonly float multiplier
 
     def __cinit__(self,
                   int sid, # sid is required
                   object symbol="",
+                  object root_symbol="",
                   object asset_name="",
                   object start_date=None,
                   object end_date=None,
                   object notice_date=None,
                   object expiration_date=None,
+                  object auto_close_date=None,
                   object first_traded=None,
-                  object exchange=""):
+                  object exchange="",
+                  object tick_size="",
+                  float multiplier=1):
 
-        self.asset_type       = FUTURE
-        self.notice_date      = notice_date
-        self.expiration_date  = expiration_date
+        self.root_symbol     = root_symbol
+        self.notice_date     = notice_date
+        self.expiration_date = expiration_date
+        self.tick_size       = tick_size
+        self.multiplier      = multiplier
+
+        if auto_close_date is None:
+            if notice_date is None:
+                self.auto_close_date = expiration_date
+            elif expiration_date is None:
+                self.auto_close_date = notice_date
+            else:
+                self.auto_close_date = min(notice_date, expiration_date)
+
+    def __str__(self):
+        if self.symbol:
+            return 'Future(%d [%s])' % (self.sid, self.symbol)
+        else:
+            return 'Future(%d)' % self.sid
 
     def __repr__(self):
-        attrs = ('symbol', 'asset_name', 'exchange',
+        attrs = ('symbol', 'root_symbol', 'asset_name', 'exchange',
                  'start_date', 'end_date', 'first_traded', 'notice_date',
-                 'expiration_date')
+                 'expiration_date', 'auto_close_date', 'tick_size',
+                 'multiplier')
         tuples = ((attr, repr(getattr(self, attr, None)))
                   for attr in attrs)
         strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
         params = ', '.join(strings)
         return 'Future(%d, %s)' % (self.sid, params)
+
+    cpdef __reduce__(self):
+        """
+        Function used by pickle to determine how to serialize/deserialize this
+        class.  Should return a tuple whose first element is self.__class__,
+        and whose second element is a tuple of all the attributes that should
+        be serialized/deserialized during pickling.
+        """
+        return (self.__class__, (self.sid,
+                                 self.symbol,
+                                 self.root_symbol,
+                                 self.asset_name,
+                                 self.start_date,
+                                 self.end_date,
+                                 self.notice_date,
+                                 self.expiration_date,
+                                 self.auto_close_date,
+                                 self.first_traded,
+                                 self.exchange,
+                                 self.tick_size,
+                                 self.multiplier,))
+
+    cpdef to_dict(self):
+        """
+        Convert to a python dict.
+        """
+        super_dict = super(Future, self).to_dict()
+        super_dict['root_symbol'] = self.root_symbol
+        super_dict['notice_date'] = self.notice_date
+        super_dict['expiration_date'] = self.expiration_date
+        super_dict['tick_size'] = self.tick_size
+        super_dict['multiplier'] = self.multiplier
+        return super_dict
+
+
+def make_asset_array(int size, Asset asset):
+    cdef np.ndarray out = np.empty([size], dtype=object)
+    out.fill(asset)
+    return out

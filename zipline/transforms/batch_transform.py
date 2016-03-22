@@ -32,10 +32,10 @@ from six import (
     iteritems
 )
 
+from zipline.utils.algo_instance import get_algo_instance
 from zipline.utils.data import MutableIndexRollingPanel
+from zipline.utils.deprecate import deprecated
 from zipline.protocol import Event
-
-from zipline.finance import trading
 
 log = logbook.Logger('BatchTransform')
 func_map = {'open_price': 'first',
@@ -67,8 +67,9 @@ def downsample_panel(minute_rp, daily_rp, mkt_close):
     cur_panel = minute_rp.get_current()
     sids = minute_rp.minor_axis
     day_frame = pd.DataFrame(columns=sids, index=cur_panel.items)
-    dt1 = trading.environment.normalize_date(mkt_close)
-    dt2 = trading.environment.next_trading_day(mkt_close)
+    env = get_algo_instance().trading_environment
+    dt1 = env.normalize_date(mkt_close)
+    dt2 = env.next_trading_day(mkt_close)
     by_close = functools.partial(get_date, mkt_close, dt1, dt2)
     for item in minute_rp.items:
         frame = cur_panel[item]
@@ -151,6 +152,8 @@ class BatchTransform(object):
 
     """
 
+    @deprecated(msg="Batch transforms are deprecated and will be removed"
+                    " in a future release. Please use 'history' instead.")
     def __init__(self,
                  func=None,
                  refresh_period=0,
@@ -161,7 +164,6 @@ class BatchTransform(object):
                  compute_only_full=True,
                  bars='daily',
                  downsample=False):
-
         """Instantiate new batch_transform object.
 
         :Arguments:
@@ -333,11 +335,12 @@ class BatchTransform(object):
         # we may get events from non-trading sources which occurr on
         # non-trading days. The book-keeping for market close and
         # trading day counting should only consider trading days.
-        if trading.environment.is_trading_day(event.dt):
-            _, mkt_close = trading.environment.get_open_and_close(event.dt)
+        env = get_algo_instance().trading_environment
+        if env.is_trading_day(event.dt):
+            _, mkt_close = env.get_open_and_close(event.dt)
             if self.bars == 'daily':
                 # Daily bars have their dt set to midnight.
-                mkt_close = trading.environment.normalize_date(mkt_close)
+                mkt_close = env.normalize_date(mkt_close)
             if event.dt == mkt_close:
                 if self.downsample:
                     downsample_panel(self.rolling_panel,
@@ -487,9 +490,9 @@ class BatchTransform(object):
 
 def batch_transform(func):
     """Decorator function to use instead of inheriting from BatchTransform.
+
     For an example on how to use this, see the doc string of BatchTransform.
     """
-
     @functools.wraps(func)
     def create_window(*args, **kwargs):
         # passes the user defined function to BatchTransform which it

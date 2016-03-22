@@ -35,11 +35,11 @@ class TestTradingCalendar(TestCase):
         """
 
         env = TradingEnvironment()
-        env_start_index = \
-            env.trading_days.searchsorted(tradingcalendar.start)
-        env_days = env.trading_days[env_start_index:]
-        cal_days = tradingcalendar.trading_days
-        self.check_days(env_days, cal_days)
+        bench_days = env.benchmark_returns[tradingcalendar.start:].index
+        bounds = env.trading_days.slice_locs(start=tradingcalendar.start,
+                                             end=bench_days[-1])
+        env_days = env.trading_days[bounds[0]:bounds[1]]
+        self.check_days(env_days, bench_days)
 
     @nottest
     def test_lse_calendar_vs_environment(self):
@@ -81,14 +81,14 @@ class TestTradingCalendar(TestCase):
         self.check_days(env_days, cal_days)
 
     def check_days(self, env_days, cal_days):
-        diff = env_days - cal_days
+        diff = env_days.difference(cal_days)
         self.assertEqual(
             len(diff),
             0,
             "{diff} should be empty".format(diff=diff)
         )
 
-        diff2 = cal_days - env_days
+        diff2 = cal_days.difference(env_days)
         self.assertEqual(
             len(diff2),
             0,

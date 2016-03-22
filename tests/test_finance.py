@@ -16,46 +16,50 @@
 """
 Tests for the zipline.finance package
 """
+from datetime import datetime, timedelta
 import itertools
 import operator
-
-import pytz
-
 from unittest import TestCase
-from datetime import datetime, timedelta
 
-import numpy as np
 
 from nose.tools import timed
-
+import numpy as np
+import pandas as pd
+import pytz
 from six.moves import range
 
+from zipline.finance.blotter import Blotter
+from zipline.finance.execution import MarketOrder, LimitOrder
+from zipline.finance.trading import TradingEnvironment
+from zipline.finance.performance import PerformanceTracker
+from zipline.finance.trading import SimulationParameters
+from zipline.gens.composites import date_sorted_sources
 import zipline.protocol
 from zipline.protocol import Event, DATASOURCE_TYPE
-
-import zipline.utils.factory as factory
-import zipline.utils.simfactory as simfactory
-
-from zipline.finance.blotter import Blotter
-from zipline.gens.composites import date_sorted_sources
-
-from zipline.finance import trading
-from zipline.finance.trading import TradingEnvironment
-from zipline.finance.execution import MarketOrder, LimitOrder
-from zipline.finance.trading import SimulationParameters
-
-from zipline.finance.performance import PerformanceTracker
-from zipline.utils.test_utils import(
+from zipline.testing import(
     setup_logger,
     teardown_logger,
     assert_single_position
 )
+import zipline.utils.factory as factory
+import zipline.utils.simfactory as simfactory
 
 DEFAULT_TIMEOUT = 15  # seconds
 EXTENDED_TIMEOUT = 90
 
+_multiprocess_can_split_ = False
+
 
 class FinanceTestCase(TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.env = TradingEnvironment()
+        cls.env.write_data(equities_identifiers=[1, 133])
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
 
     def setUp(self):
         self.zipline_test_config = {
@@ -72,8 +76,8 @@ class FinanceTestCase(TestCase):
         sim_params = factory.create_simulation_parameters()
         trade_source = factory.create_daily_trade_source(
             [133],
-            200,
-            sim_params
+            sim_params,
+            env=self.env,
         )
         prev = None
         for trade in trade_source:
@@ -227,7 +231,8 @@ class FinanceTestCase(TestCase):
             price,
             volume,
             trade_interval,
-            sim_params
+            sim_params,
+            env=self.env,
         )
 
         if alternate:
@@ -261,7 +266,7 @@ class FinanceTestCase(TestCase):
             self.assertEqual(order.sid, sid)
             self.assertEqual(order.amount, order_amount * alternator ** i)
 
-        tracker = PerformanceTracker(sim_params)
+        tracker = PerformanceTracker(sim_params, env=self.env)
 
         benchmark_returns = [
             Event({'dt': dt,
@@ -269,7 +274,7 @@ class FinanceTestCase(TestCase):
                    'type':
                    zipline.protocol.DATASOURCE_TYPE.BENCHMARK,
                    'source_id': 'benchmarks'})
-            for dt, ret in trading.environment.benchmark_returns.iteritems()
+            for dt, ret in self.env.benchmark_returns.iteritems()
             if dt.date() >= sim_params.period_start.date() and
             dt.date() <= sim_params.period_end.date()
         ]
@@ -286,9 +291,11 @@ class FinanceTestCase(TestCase):
 
                     for txn, order in blotter.process_trade(event):
                         transactions.append(txn)
-                        tracker.process_event(txn)
-
-                tracker.process_event(event)
+                        tracker.process_transaction(txn)
+                elif event.type == DATASOURCE_TYPE.BENCHMARK:
+                    tracker.process_benchmark(event)
+                elif event.type == DATASOURCE_TYPE.TRADE:
+                    tracker.process_trade(event)
 
         if complete_fill:
             self.assertEqual(len(transactions), len(order_list))
@@ -363,6 +370,10 @@ class TradingEnvironmentTestCase(TestCase):
     def setUpClass(cls):
         cls.env = TradingEnvironment()
 
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
+
     @timed(DEFAULT_TIMEOUT)
     def test_is_trading_day(self):
         # holidays taken from: http://www.nyse.com/press/1191407641943.html
@@ -406,6 +417,7 @@ class TradingEnvironmentTestCase(TestCase):
             period_start=datetime(2008, 1, 1, tzinfo=pytz.utc),
             period_end=datetime(2008, 12, 31, tzinfo=pytz.utc),
             capital_base=100000,
+            env=self.env,
         )
 
         self.assertTrue(env.last_close.month == 12)
@@ -422,10 +434,11 @@ class TradingEnvironmentTestCase(TestCase):
         #  20 21 22 23 24 25 26
         #  27 28 29 30 31
 
-        env = SimulationParameters(
+        params = SimulationParameters(
             period_start=datetime(2007, 12, 31, tzinfo=pytz.utc),
             period_end=datetime(2008, 1, 7, tzinfo=pytz.utc),
             capital_base=100000,
+            env=self.env,
         )
 
         expected_trading_days = (
@@ -441,9 +454,9 @@ class TradingEnvironmentTestCase(TestCase):
         )
 
         num_expected_trading_days = 5
-        self.assertEquals(num_expected_trading_days, env.days_in_period)
+        self.assertEquals(num_expected_trading_days, params.days_in_period)
         np.testing.assert_array_equal(expected_trading_days,
-                                      env.trading_days.tolist())
+                                      params.trading_days.tolist())
 
     @timed(DEFAULT_TIMEOUT)
     def test_market_minute_window(self):
@@ -527,8 +540,16 @@ class TradingEnvironmentTestCase(TestCase):
         self.assertTrue(all(friday == minutes[31:421]))
         self.assertTrue(all(thursday == minutes[421:]))
 
+    def test_min_date(self):
+        min_date = pd.Timestamp('2016-03-04', tz='UTC')
+        env = TradingEnvironment(min_date=min_date)
+
+        self.assertGreaterEqual(env.first_trading_day, min_date)
+        self.assertGreaterEqual(env.treasury_curves.index[0],
+                                min_date)
+
     def test_max_date(self):
-        max_date = datetime(2008, 8, 1, tzinfo=pytz.utc)
+        max_date = pd.Timestamp('2008-08-01', tz='UTC')
         env = TradingEnvironment(max_date=max_date)
 
         self.assertLessEqual(env.last_trading_day, max_date)

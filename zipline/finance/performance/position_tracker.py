@@ -1,65 +1,178 @@
+#
+# Copyright 2015 Quantopian, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import division
-from operator import mul
 
 import logbook
 import numpy as np
 import pandas as pd
 from pandas.lib import checknull
+from collections import namedtuple
 try:
     # optional cython based OrderedDict
     from cyordereddict import OrderedDict
 except ImportError:
     from collections import OrderedDict
-from six import iteritems
-from six.moves import map, filter
+from six import iteritems, itervalues
 
+from zipline.finance.transaction import Transaction
 from zipline.utils.serialization_utils import (
     VERSION_LABEL
 )
 
 import zipline.protocol as zp
+from zipline.assets import (
+    Equity, Future
+)
+from zipline.errors import PositionTrackerMissingAssetFinder
 from . position import positiondict
 
 log = logbook.Logger('Performance')
 
 
+PositionStats = namedtuple('PositionStats',
+                           ['net_exposure',
+                            'gross_value',
+                            'gross_exposure',
+                            'short_value',
+                            'short_exposure',
+                            'shorts_count',
+                            'long_value',
+                            'long_exposure',
+                            'longs_count',
+                            'net_value'])
+
+
+def calc_position_values(amounts,
+                         last_sale_prices,
+                         value_multipliers):
+    iter_amount_price_multiplier = zip(
+        amounts,
+        last_sale_prices,
+        itervalues(value_multipliers),
+    )
+    return [
+        price * amount * multiplier for
+        price, amount, multiplier in iter_amount_price_multiplier
+    ]
+
+
+def calc_net(values):
+    # Returns 0.0 if there are no values.
+    return sum(values, np.float64())
+
+
+def calc_position_exposures(amounts,
+                            last_sale_prices,
+                            exposure_multipliers):
+    iter_amount_price_multiplier = zip(
+        amounts,
+        last_sale_prices,
+        itervalues(exposure_multipliers),
+    )
+    return [
+        price * amount * multiplier for
+        price, amount, multiplier in iter_amount_price_multiplier
+    ]
+
+
+def calc_long_value(position_values):
+    return sum(i for i in position_values if i > 0)
+
+
+def calc_short_value(position_values):
+    return sum(i for i in position_values if i < 0)
+
+
+def calc_long_exposure(position_exposures):
+    return sum(i for i in position_exposures if i > 0)
+
+
+def calc_short_exposure(position_exposures):
+    return sum(i for i in position_exposures if i < 0)
+
+
+def calc_longs_count(position_exposures):
+    return sum(1 for i in position_exposures if i > 0)
+
+
+def calc_shorts_count(position_exposures):
+    return sum(1 for i in position_exposures if i < 0)
+
+
+def calc_gross_exposure(long_exposure, short_exposure):
+    return long_exposure + abs(short_exposure)
+
+
+def calc_gross_value(long_value, short_value):
+    return long_value + abs(short_value)
+
+
 class PositionTracker(object):
 
-    def __init__(self):
+    def __init__(self, asset_finder):
+        self.asset_finder = asset_finder
+
         # sid => position object
         self.positions = positiondict()
         # Arrays for quick calculations of positions value
-        self._position_amounts = OrderedDict()
-        self._position_last_sale_prices = OrderedDict()
+        self._position_value_multipliers = OrderedDict()
+        self._position_exposure_multipliers = OrderedDict()
         self._unpaid_dividends = pd.DataFrame(
             columns=zp.DIVIDEND_PAYMENT_FIELDS,
         )
         self._positions_store = zp.Positions()
 
+    def _update_asset(self, sid):
+        try:
+            self._position_value_multipliers[sid]
+            self._position_exposure_multipliers[sid]
+        except KeyError:
+            # Check if there is an AssetFinder
+            if self.asset_finder is None:
+                raise PositionTrackerMissingAssetFinder()
+
+            # Collect the value multipliers from applicable sids
+            asset = self.asset_finder.retrieve_asset(sid)
+            if isinstance(asset, Equity):
+                self._position_value_multipliers[sid] = 1
+                self._position_exposure_multipliers[sid] = 1
+            if isinstance(asset, Future):
+                self._position_value_multipliers[sid] = 0
+                self._position_exposure_multipliers[sid] = asset.multiplier
+
     def update_last_sale(self, event):
         # NOTE, PerformanceTracker already vetted as TRADE type
         sid = event.sid
         if sid not in self.positions:
-            return
+            return 0
 
         price = event.price
-        if not checknull(price):
-            pos = self.positions[sid]
-            pos.last_sale_date = event.dt
-            pos.last_sale_price = price
-            self._position_last_sale_prices[sid] = price
-            self._position_values = None  # invalidate cache
-        sid = event.sid
-        price = event.price
+
+        if checknull(price):
+            return 0
+
+        pos = self.positions[sid]
+        pos.last_sale_date = event.dt
+        pos.last_sale_price = price
 
     def update_positions(self, positions):
         # update positions in batch
         self.positions.update(positions)
         for sid, pos in iteritems(positions):
-            self._position_amounts[sid] = pos.amount
-            self._position_last_sale_prices[sid] = pos.last_sale_price
-            # Invalidate cache.
-            self._position_values = None  # invalidate cache
+            self._update_asset(sid)
 
     def update_position(self, sid, amount=None, last_sale_price=None,
                         last_sale_date=None, cost_basis=None):
@@ -67,12 +180,9 @@ class PositionTracker(object):
 
         if amount is not None:
             pos.amount = amount
-            self._position_amounts[sid] = amount
-            self._position_values = None  # invalidate cache
+            self._update_asset(sid=sid)
         if last_sale_price is not None:
             pos.last_sale_price = last_sale_price
-            self._position_last_sale_prices[sid] = last_sale_price
-            self._position_values = None  # invalidate cache
         if last_sale_date is not None:
             pos.last_sale_date = last_sale_date
         if cost_basis is not None:
@@ -81,68 +191,23 @@ class PositionTracker(object):
     def execute_transaction(self, txn):
         # Update Position
         # ----------------
-
         sid = txn.sid
         position = self.positions[sid]
         position.update(txn)
-        self._position_amounts[sid] = position.amount
-        self._position_last_sale_prices[sid] = position.last_sale_price
-        self._position_values = None  # invalidate cache
+        self._update_asset(sid)
 
-    def handle_commission(self, commission):
+    def handle_commission(self, sid, cost):
         # Adjust the cost basis of the stock if we own it
-        if commission.sid in self.positions:
-            self.positions[commission.sid].\
-                adjust_commission_cost_basis(commission)
-
-    _position_values = None
-
-    @property
-    def position_values(self):
-        """
-        Invalidate any time self._position_amounts or
-        self._position_last_sale_prices is changed.
-        """
-        if self._position_values is None:
-            vals = list(map(mul, self._position_amounts.values(),
-                        self._position_last_sale_prices.values()))
-            self._position_values = vals
-        return self._position_values
-
-    def calculate_positions_value(self):
-        if len(self.position_values) == 0:
-            return np.float64(0)
-
-        return sum(self.position_values)
-
-    def _longs_count(self):
-        return sum(map(lambda x: x > 0, self.position_values))
-
-    def _long_exposure(self):
-        return sum(filter(lambda x: x > 0, self.position_values))
-
-    def _shorts_count(self):
-        return sum(map(lambda x: x < 0, self.position_values))
-
-    def _short_exposure(self):
-        return sum(filter(lambda x: x < 0, self.position_values))
-
-    def _gross_exposure(self):
-        return self._long_exposure() + abs(self._short_exposure())
-
-    def _net_exposure(self):
-        return self.calculate_positions_value()
+        if sid in self.positions:
+            self.positions[sid].adjust_commission_cost_basis(sid, cost)
 
     def handle_split(self, split):
         if split.sid in self.positions:
             # Make the position object handle the split. It returns the
             # leftover cash from a fractional share, if there is any.
             position = self.positions[split.sid]
-            leftover_cash = position.handle_split(split)
-            self._position_amounts[split.sid] = position.amount
-            self._position_last_sale_prices[split.sid] = \
-                position.last_sale_price
-            self._position_values = None  # invalidate cache
+            leftover_cash = position.handle_split(split.sid, split.ratio)
+            self._update_asset(split.sid)
             return leftover_cash
 
     def _maybe_earn_dividend(self, dividend):
@@ -203,19 +268,40 @@ class PositionTracker(object):
             stock = row['payment_sid']
             share_count = row['share_count']
             # note we create a Position for stock dividend if we don't
-            # already own the security
+            # already own the asset
             position = self.positions[stock]
 
             position.amount += share_count
-            self._position_amounts[stock] = position.amount
-            self._position_last_sale_prices[stock] = position.last_sale_price
+            self._update_asset(stock)
 
         # Add cash equal to the net cash payed from all dividends.  Note that
-        # "negative cash" is effectively paid if we're short a security,
+        # "negative cash" is effectively paid if we're short an asset,
         # representing the fact that we're required to reimburse the owner of
         # the stock for any dividends paid while borrowing.
         net_cash_payment = payments['cash_amount'].fillna(0).sum()
         return net_cash_payment
+
+    def maybe_create_close_position_transaction(self, event):
+        try:
+            pos = self.positions[event.sid]
+            amount = pos.amount
+            if amount == 0:
+                return None
+        except KeyError:
+            return None
+        if 'price' in event:
+            price = event.price
+        else:
+            price = pos.last_sale_price
+        txn = Transaction(
+            sid=event.sid,
+            amount=(-1 * pos.amount),
+            dt=event.dt,
+            price=price,
+            commission=0,
+            order_id=None,
+        )
+        return txn
 
     def get_positions(self):
 
@@ -249,23 +335,71 @@ class PositionTracker(object):
                 positions.append(pos.to_dict())
         return positions
 
+    def get_nonempty_position_sids(self):
+        return [sid for sid, pos in iteritems(self.positions) if pos.amount]
+
+    def stats(self):
+        amounts = []
+        last_sale_prices = []
+        for pos in itervalues(self.positions):
+            amounts.append(pos.amount)
+            last_sale_prices.append(pos.last_sale_price)
+
+        position_values = calc_position_values(
+            amounts,
+            last_sale_prices,
+            self._position_value_multipliers
+        )
+
+        position_exposures = calc_position_exposures(
+            amounts,
+            last_sale_prices,
+            self._position_exposure_multipliers
+        )
+
+        long_value = calc_long_value(position_values)
+        short_value = calc_short_value(position_values)
+        gross_value = calc_gross_value(long_value, short_value)
+        long_exposure = calc_long_exposure(position_exposures)
+        short_exposure = calc_short_exposure(position_exposures)
+        gross_exposure = calc_gross_exposure(long_exposure, short_exposure)
+        net_exposure = calc_net(position_exposures)
+        longs_count = calc_longs_count(position_exposures)
+        shorts_count = calc_shorts_count(position_exposures)
+        net_value = calc_net(position_values)
+
+        return PositionStats(
+            long_value=long_value,
+            gross_value=gross_value,
+            short_value=short_value,
+            long_exposure=long_exposure,
+            short_exposure=short_exposure,
+            gross_exposure=gross_exposure,
+            net_exposure=net_exposure,
+            longs_count=longs_count,
+            shorts_count=shorts_count,
+            net_value=net_value
+        )
+
     def __getstate__(self):
         state_dict = {}
 
+        state_dict['asset_finder'] = self.asset_finder
         state_dict['positions'] = dict(self.positions)
         state_dict['unpaid_dividends'] = self._unpaid_dividends
 
-        STATE_VERSION = 1
+        STATE_VERSION = 4
         state_dict[VERSION_LABEL] = STATE_VERSION
         return state_dict
 
     def __setstate__(self, state):
-        OLDEST_SUPPORTED_STATE = 1
+        OLDEST_SUPPORTED_STATE = 3
         version = state.pop(VERSION_LABEL)
 
         if version < OLDEST_SUPPORTED_STATE:
             raise BaseException("PositionTracker saved state is too old.")
 
+        self.asset_finder = state['asset_finder']
         self.positions = positiondict()
         # note that positions_store is temporary and gets regened from
         # .positions
@@ -274,7 +408,8 @@ class PositionTracker(object):
         self._unpaid_dividends = state['unpaid_dividends']
 
         # Arrays for quick calculations of positions value
-        self._position_amounts = OrderedDict()
-        self._position_last_sale_prices = OrderedDict()
+        self._position_value_multipliers = OrderedDict()
+        self._position_exposure_multipliers = OrderedDict()
 
+        # Update positions is called without a finder
         self.update_positions(state['positions'])

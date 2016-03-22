@@ -25,6 +25,7 @@ from unittest import TestCase
 import numpy as np
 from numpy.testing import assert_allclose
 
+from zipline.finance.trading import TradingEnvironment
 from zipline.algorithm import TradingAlgorithm
 import zipline.utils.factory as factory
 from zipline.api import add_transform, get_datetime
@@ -41,6 +42,7 @@ def handle_data_wrapper(f):
         else:
             context.mins_for_days[-1] += 1
 
+        hist = context.history(2, '1d', 'close_price')
         for n in (1, 2, 3):
             if n in data:
                 if data[n].dt == dt:
@@ -53,7 +55,7 @@ def handle_data_wrapper(f):
                 context.price_bars[n].append(np.nan)
                 context.vol_bars[n].append(0)
 
-            context.last_close_prices[n] = context.price_bars[n][-2]
+            context.last_close_prices[n] = hist[n][0]
 
         if context.warmup < 0:
             return f(context, data)
@@ -101,6 +103,7 @@ def with_algo(f):
             initialize=initialize_with(self, tfm_name, days),
             handle_data=handle_data_wrapper(f),
             sim_params=sim_params,
+            env=self.env,
         )
         algo.run(source)
 
@@ -115,32 +118,35 @@ class TransformTestCase(TestCase):
     def setUpClass(cls):
         random.seed(0)
         cls.sids = (1, 2, 3)
-
         minute_sim_ps = factory.create_simulation_parameters(
             num_days=3,
-            sids=cls.sids,
             data_frequency='minute',
             emission_rate='minute',
         )
         daily_sim_ps = factory.create_simulation_parameters(
             num_days=30,
-            sids=cls.sids,
             data_frequency='daily',
             emission_rate='daily',
         )
+        cls.env = TradingEnvironment()
+        cls.env.write_data(equities_identifiers=[1, 2, 3])
         cls.sim_and_source = {
             'minute': (minute_sim_ps, factory.create_minutely_trade_source(
                 cls.sids,
-                trade_count=45,
                 sim_params=minute_sim_ps,
+                env=cls.env,
             )),
             'daily': (daily_sim_ps, factory.create_trade_source(
                 cls.sids,
-                trade_count=90,
                 trade_time_increment=timedelta(days=1),
                 sim_params=daily_sim_ps,
+                env=cls.env,
             )),
         }
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
 
     def tearDown(self):
         """

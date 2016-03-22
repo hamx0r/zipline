@@ -15,6 +15,7 @@
 
 from nose_parameterized import parameterized
 from unittest import TestCase
+from zipline.finance.trading import TradingEnvironment
 
 from .serialization_cases import (
     object_serialization_cases,
@@ -36,6 +37,13 @@ def gather_bad_dicts(state):
 
 
 class SerializationTestCase(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.env = TradingEnvironment()
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.env
 
     @parameterized.expand(object_serialization_cases())
     def test_object_serialization(self,
